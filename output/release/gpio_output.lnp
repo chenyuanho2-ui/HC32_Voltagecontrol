@@ -1,0 +1,25 @@
+--cpu Cortex-M0+
+".\output\release\startup_hc32f005.o"
+".\output\release\interrupts_hc32f005.o"
+".\output\release\system_hc32f005.o"
+".\output\release\main.o"
+".\output\release\ddl.o"
+".\output\release\gpio.o"
+".\output\release\sysctrl.o"
+".\output\release\adc.o"
+".\output\release\uart.o"
+".\output\release\calibration.o"
+".\output\release\cmd_basic.o"
+".\output\release\cmd_buzzer.o"
+".\output\release\cmd_cal.o"
+".\output\release\cmd_direction.o"
+".\output\release\cmd_help.o"
+".\output\release\cmd_ramp.o"
+".\output\release\cmd_self_test.o"
+".\output\release\cmd_start.o"
+".\output\release\cmd_timer.o"
+".\output\release\instruction_manager.o"
+--library_type=microlib --nodebug --strict --scatter ".\output\release\gpio_output.sct"
+--keep=*Handler --summary_stderr --info summarysizes --map --load_addr_map_info --symbols
+--info sizes --info totals
+--list ".\output\release\gpio_output.map" -o .\output\release\gpio_output.axf

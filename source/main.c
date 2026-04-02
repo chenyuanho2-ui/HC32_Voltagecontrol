@@ -20,6 +20,10 @@
 #define UART_RX_PIN  GpioPin3
 #define UART_AF      GpioAf1
 
+#define SOFTUART_RX_PORT GpioPort0
+#define SOFTUART_RX_PIN  GpioPin3
+#define SOFTUART_BAUD    9600u
+
 // ADC 引脚 (此处使用 ADC通道3 即 P33)
 #define ADC_CH       AdcExInputCH3
 #define ADC_PORT     GpioPort3
@@ -43,6 +47,7 @@ static void Tim0_StartForUartBaud(uint16_t reload)
 
 static void Uart0_SendByteTimeout(uint8_t data)
 {
+    Uart_ClrStatus(M0P_UART0, UartTC);
     M0P_UART0->SBUF_f.SBUF = data;
     for (uint32_t i = 0; i < 0x20000u; i++)
     {
@@ -52,7 +57,67 @@ static void Uart0_SendByteTimeout(uint8_t data)
             break;
         }
     }
-    delay100us(2);
+}
+
+static void SoftUart_DelayCycles(uint32_t cycles)
+{
+    if (0u == cycles)
+    {
+        return;
+    }
+
+    SysTick->LOAD = 0xFFFFFF;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_CLKSOURCE_Msk;
+
+    uint32_t start = SysTick->VAL & 0xFFFFFFu;
+    while ((((start - (SysTick->VAL & 0xFFFFFFu)) & 0xFFFFFFu)) < cycles)
+    {
+    }
+
+    SysTick->CTRL = (SysTick->CTRL & (~SysTick_CTRL_ENABLE_Msk));
+}
+
+static uint8_t SoftUart_TryReadByte(uint8_t* out)
+{
+    if (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
+    {
+        return 0u;
+    }
+
+    uint32_t bit_cycles = (SystemCoreClock / SOFTUART_BAUD);
+    if (bit_cycles < 16u)
+    {
+        bit_cycles = 16u;
+    }
+
+    SoftUart_DelayCycles(bit_cycles / 2u);
+    if (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
+    {
+        return 0u;
+    }
+
+    SoftUart_DelayCycles(bit_cycles);
+
+    uint8_t value = 0u;
+    for (uint8_t i = 0u; i < 8u; i++)
+    {
+        if (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
+        {
+            value |= (uint8_t)(1u << i);
+        }
+        SoftUart_DelayCycles(bit_cycles);
+    }
+
+    uint8_t stop = (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN)) ? 1u : 0u;
+    SoftUart_DelayCycles(bit_cycles);
+    if (0u == stop)
+    {
+        return 0u;
+    }
+
+    *out = value;
+    return 1u;
 }
 
 int fputc(int ch, FILE *f)
@@ -93,17 +158,16 @@ void Uart_Init_Config(void)
     stcRxCfg.enPd = GpioPdDisable;
     stcRxCfg.enOD = GpioOdDisable;
     Gpio_Init(UART_RX_PORT, UART_RX_PIN, &stcRxCfg);
-    Gpio_SetAfMode(UART_RX_PORT, UART_RX_PIN, UART_AF);
 
     // 3. UART工作模式配置 (模式1: 8位异步，无校验)
     stcCfg.enRunMode = UartMode1;
     Uart_Init(M0P_UART0, &stcCfg);
 
-    // 4. 设置波特率 (115200)
+    // 4. 设置波特率 (9600)
     stcBaud.enMode = UartMode1;
-    stcBaud.bDbaud = FALSE;            // 正常波特率，不双倍
+    stcBaud.bDbaud = FALSE;
     stcBaud.u32Pclk = Sysctrl_GetPClkFreq(); // 获取当前PCLK时钟频率
-    stcBaud.u32Baud = 115200;
+    stcBaud.u32Baud = SOFTUART_BAUD;
     uint16_t reload = Uart_SetBaudRate(M0P_UART0, &stcBaud);
     Tim0_StartForUartBaud(reload);
 
@@ -111,7 +175,6 @@ void Uart_Init_Config(void)
     Uart_ClrStatus(M0P_UART0, UartRC);
     Uart_ClrStatus(M0P_UART0, UartTC);
     Uart_EnableFunc(M0P_UART0, UartRenFunc);
-    Uart_EnableIrq(M0P_UART0, UartRxIrq);
 }
 
 void Adc_Init_Config(void)
@@ -211,11 +274,9 @@ int main(void)
         static char cmd_buf[64];
         static uint32_t cmd_len = 0u;
 
-        while (TRUE == Uart_GetStatus(M0P_UART0, UartRC))
+        uint8_t c = 0u;
+        while (1u == SoftUart_TryReadByte(&c))
         {
-            uint8_t c = Uart_ReceiveData(M0P_UART0);
-            Uart_ClrStatus(M0P_UART0, UartRC);
-
             if (c == '\b' || c == 0x7Fu)
             {
                 if (cmd_len > 0u)
