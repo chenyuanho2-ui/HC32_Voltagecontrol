@@ -63,10 +63,28 @@ typedef struct
 } miku_pwm_chan_t;
 
 static uint32_t g_pwm_tick_hz = 0u;
-static uint32_t g_pwm_last_delta = 1u;
-static miku_pwm_chan_t g_pwm_motor;
-static miku_pwm_chan_t g_pwm_buzzer;
-static uint8_t g_buzzer_volume_percent = 10u;
+static volatile uint32_t g_pwm_last_delta = 1u;
+static volatile miku_pwm_chan_t g_pwm_motor;
+static volatile miku_pwm_chan_t g_pwm_buzzer;
+static volatile uint8_t g_buzzer_volume_percent = 10u;
+
+static uint32_t Miku_PwmLock(void)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t old_uie = (uint32_t)M0P_TIM2->CR_f.UIE;
+    M0P_TIM2->CR_f.UIE = FALSE;
+    __set_PRIMASK(primask);
+    return old_uie;
+}
+
+static void Miku_PwmUnlock(uint32_t old_uie)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    M0P_TIM2->CR_f.UIE = (old_uie != 0u) ? TRUE : FALSE;
+    __set_PRIMASK(primask);
+}
 
 static uint16_t Miku_CalcTimReload(uint32_t delta_ticks)
 {
@@ -157,7 +175,7 @@ static void Miku_PwmRecalcAndApply(void)
     Miku_PwmApplySchedule(next);
 }
 
-static void Miku_PwmChanSetEnable(miku_pwm_chan_t* ch, en_gpio_port_t port, en_gpio_pin_t pin, uint8_t enable)
+static void Miku_PwmChanSetEnable(volatile miku_pwm_chan_t* ch, en_gpio_port_t port, en_gpio_pin_t pin, uint8_t enable)
 {
     if (0u == enable)
     {
@@ -193,82 +211,98 @@ static void Miku_PwmChanSetEnable(miku_pwm_chan_t* ch, en_gpio_port_t port, en_g
 
 void Miku_Motor_SetSpeedPercent(float speed_percent)
 {
-    if (speed_percent <= 0.0f)
-    {
-        g_pwm_motor.high_ticks = 0u;
-        g_pwm_motor.low_ticks = 1u;
-        Miku_PwmChanSetEnable(&g_pwm_motor, MIKU_MOTOR_PWM_PORT, MIKU_MOTOR_PWM_PIN, 0u);
-        Miku_PwmRecalcAndApply();
-        return;
-    }
-    if (speed_percent >= 100.0f)
-    {
-        g_pwm_motor.high_ticks = 1u;
-        g_pwm_motor.low_ticks = 0u;
-        Miku_PwmChanSetEnable(&g_pwm_motor, MIKU_MOTOR_PWM_PORT, MIKU_MOTOR_PWM_PIN, 1u);
-        Miku_PwmRecalcAndApply();
-        return;
-    }
-
     uint32_t period_ticks = (g_pwm_tick_hz / MIKU_MOTOR_PWM_FREQ_HZ);
     if (period_ticks < 2u)
     {
         period_ticks = 2u;
     }
-    uint32_t duty = (uint32_t)(speed_percent * 100.0f);
-    if (duty > 10000u)
+
+    uint32_t high_ticks = 0u;
+    uint32_t low_ticks = 1u;
+    uint8_t enable = 0u;
+
+    if (speed_percent <= 0.0f)
     {
-        duty = 10000u;
+        enable = 0u;
     }
-    uint32_t high = (period_ticks * duty) / 10000u;
-    if (high < 1u)
+    else if (speed_percent >= 100.0f)
     {
-        high = 1u;
+        high_ticks = 1u;
+        low_ticks = 0u;
+        enable = 1u;
     }
-    if (high >= period_ticks)
+    else
     {
-        high = period_ticks - 1u;
+        uint32_t duty = (uint32_t)(speed_percent * 100.0f);
+        if (duty > 10000u)
+        {
+            duty = 10000u;
+        }
+        uint32_t high = (period_ticks * duty) / 10000u;
+        if (high < 1u)
+        {
+            high = 1u;
+        }
+        if (high >= period_ticks)
+        {
+            high = period_ticks - 1u;
+        }
+        high_ticks = high;
+        low_ticks = period_ticks - high;
+        enable = 1u;
     }
-    g_pwm_motor.high_ticks = high;
-    g_pwm_motor.low_ticks = period_ticks - high;
-    Miku_PwmChanSetEnable(&g_pwm_motor, MIKU_MOTOR_PWM_PORT, MIKU_MOTOR_PWM_PIN, 1u);
+
+    uint32_t lock = Miku_PwmLock();
+    g_pwm_motor.high_ticks = high_ticks;
+    g_pwm_motor.low_ticks = low_ticks;
+    Miku_PwmChanSetEnable(&g_pwm_motor, MIKU_MOTOR_PWM_PORT, MIKU_MOTOR_PWM_PIN, enable);
     Miku_PwmRecalcAndApply();
+    Miku_PwmUnlock(lock);
 }
 
 void Miku_Buzzer_SetEnable(uint8_t enable)
 {
-    if (0u == enable)
-    {
-        g_pwm_buzzer.high_ticks = 0u;
-        g_pwm_buzzer.low_ticks = 1u;
-        Miku_PwmChanSetEnable(&g_pwm_buzzer, MIKU_BUZZER_PWM_PORT, MIKU_BUZZER_PWM_PIN, 0u);
-        Miku_PwmRecalcAndApply();
-        return;
-    }
-
     uint32_t period_ticks = (g_pwm_tick_hz / MIKU_BUZZER_PWM_FREQ_HZ);
     if (period_ticks < 2u)
     {
         period_ticks = 2u;
     }
-    uint32_t vol = g_buzzer_volume_percent;
-    if (vol > 50u)
+
+    uint32_t high_ticks = 0u;
+    uint32_t low_ticks = 1u;
+    uint8_t en = 0u;
+
+    if (0u == enable)
     {
-        vol = 50u;
+        en = 0u;
     }
-    uint32_t high = (period_ticks * vol) / 100u;
-    if (high < 1u)
+    else
     {
-        high = 1u;
+        uint32_t vol = g_buzzer_volume_percent;
+        if (vol > 50u)
+        {
+            vol = 50u;
+        }
+        uint32_t high = (period_ticks * vol) / 100u;
+        if (high < 1u)
+        {
+            high = 1u;
+        }
+        if (high >= period_ticks)
+        {
+            high = period_ticks - 1u;
+        }
+        high_ticks = high;
+        low_ticks = period_ticks - high;
+        en = 1u;
     }
-    if (high >= period_ticks)
-    {
-        high = period_ticks - 1u;
-    }
-    g_pwm_buzzer.high_ticks = high;
-    g_pwm_buzzer.low_ticks = period_ticks - high;
-    Miku_PwmChanSetEnable(&g_pwm_buzzer, MIKU_BUZZER_PWM_PORT, MIKU_BUZZER_PWM_PIN, 1u);
+
+    uint32_t lock = Miku_PwmLock();
+    g_pwm_buzzer.high_ticks = high_ticks;
+    g_pwm_buzzer.low_ticks = low_ticks;
+    Miku_PwmChanSetEnable(&g_pwm_buzzer, MIKU_BUZZER_PWM_PORT, MIKU_BUZZER_PWM_PIN, en);
     Miku_PwmRecalcAndApply();
+    Miku_PwmUnlock(lock);
 }
 
 void Miku_Buzzer_SetVolume(uint8_t volume_percent)

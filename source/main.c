@@ -5,6 +5,7 @@
 #include "adc.h"
 #include "sysctrl.h" 
 #include "instruction_manager.h"
+#include "interrupts_hc32f005.h"
 #include <stdio.h>
 
 
@@ -20,111 +21,168 @@
 #define UART_RX_PIN  GpioPin3
 #define UART_AF      GpioAf1
 
+#define SOFTUART_TX_PORT GpioPort0
+#define SOFTUART_TX_PIN  GpioPin2
 #define SOFTUART_RX_PORT GpioPort0
 #define SOFTUART_RX_PIN  GpioPin3
 #define SOFTUART_BAUD    9600u
+#define SOFTUART_TICKS_PER_BIT 8u
+#define SOFTUART_TICK_HZ (SOFTUART_BAUD * SOFTUART_TICKS_PER_BIT)
+#define SOFTUART_RX_START_TICKS (SOFTUART_TICKS_PER_BIT + (SOFTUART_TICKS_PER_BIT / 2u))
+#define SOFTUART_RX_BUF_SIZE 128u
+#define SOFTUART_TX_BUF_SIZE 256u
 
 // ADC 引脚 (此处使用 ADC通道3 即 P33)
 #define ADC_CH       AdcExInputCH3
 #define ADC_PORT     GpioPort3
 #define ADC_PIN      GpioPin3
 
-// ===================== 串口重定向 =====================
-// 重定义 fputc 函数，使得 printf 可以通过串口输出
-static void Tim0_StartForUartBaud(uint16_t reload)
-{
-    M0P_TIM0->CR_f.CTEN = FALSE;
-    M0P_TIM0->CR_f.GATEP = 0u;
-    M0P_TIM0->CR_f.GATE = 0u;
-    M0P_TIM0->CR_f.PRS = 0u;
-    M0P_TIM0->CR_f.TOGEN = TRUE;
-    M0P_TIM0->CR_f.CT = 0u;
-    M0P_TIM0->CR_f.MD = 1u;
-    M0P_TIM0->ARR = reload;
-    M0P_TIM0->CNT = reload;
-    M0P_TIM0->CR_f.CTEN = TRUE;
-}
+static volatile uint8_t g_su_rx_buf[SOFTUART_RX_BUF_SIZE];
+static volatile uint16_t g_su_rx_w = 0u;
+static volatile uint16_t g_su_rx_r = 0u;
 
-static void Uart0_SendByteTimeout(uint8_t data)
+static volatile uint8_t g_su_tx_buf[SOFTUART_TX_BUF_SIZE];
+static volatile uint16_t g_su_tx_w = 0u;
+static volatile uint16_t g_su_tx_r = 0u;
+
+static volatile uint8_t g_su_tx_active = 0u;
+static volatile uint8_t g_su_tx_bitpos = 0u;
+static volatile uint8_t g_su_tx_tick = 0u;
+static volatile uint16_t g_su_tx_frame = 0u;
+
+static volatile uint8_t g_su_rx_active = 0u;
+static volatile uint8_t g_su_rx_bitpos = 0u;
+static volatile uint8_t g_su_rx_value = 0u;
+static volatile uint8_t g_su_rx_sample_ticks = 0u;
+
+static uint16_t SoftUart_CalcTimReload(uint32_t tick_hz)
 {
-    Uart_ClrStatus(M0P_UART0, UartTC);
-    M0P_UART0->SBUF_f.SBUF = data;
-    for (uint32_t i = 0; i < 0x20000u; i++)
+    uint32_t pclk = Sysctrl_GetPClkFreq();
+    if (0u == pclk)
     {
-        if (TRUE == Uart_GetStatus(M0P_UART0, UartTC))
-        {
-            Uart_ClrStatus(M0P_UART0, UartTC);
-            break;
-        }
+        pclk = SystemCoreClock;
     }
+    uint32_t delta = pclk / tick_hz;
+    if (delta < 1u)
+    {
+        delta = 1u;
+    }
+    if (delta > 65535u)
+    {
+        delta = 65535u;
+    }
+    return (uint16_t)(0x10000u - delta);
 }
 
-static void SoftUart_DelayCycles(uint32_t cycles)
+static void SoftUart_TxKickFromIsr(void)
 {
-    if (0u == cycles)
+    if (g_su_tx_active)
+    {
+        return;
+    }
+    if (g_su_tx_r == g_su_tx_w)
     {
         return;
     }
 
-    SysTick->LOAD = 0xFFFFFF;
-    SysTick->VAL = 0;
-    SysTick->CTRL = SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_CLKSOURCE_Msk;
+    uint8_t b = g_su_tx_buf[g_su_tx_r];
+    g_su_tx_r = (uint16_t)((g_su_tx_r + 1u) & (SOFTUART_TX_BUF_SIZE - 1u));
 
-    uint32_t start = SysTick->VAL & 0xFFFFFFu;
-    while ((((start - (SysTick->VAL & 0xFFFFFFu)) & 0xFFFFFFu)) < cycles)
-    {
-    }
-
-    SysTick->CTRL = (SysTick->CTRL & (~SysTick_CTRL_ENABLE_Msk));
+    g_su_tx_frame = (uint16_t)((1u << 9) | ((uint16_t)b << 1));
+    g_su_tx_bitpos = 0u;
+    g_su_tx_tick = 0u;
+    g_su_tx_active = 1u;
 }
 
-static uint8_t SoftUart_TryReadByte(uint8_t* out)
+static void SoftUart_WriteByte(uint8_t b)
 {
-    if (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
+    uint16_t next;
+    do
     {
-        return 0u;
-    }
-
-    uint32_t bit_cycles = (SystemCoreClock / SOFTUART_BAUD);
-    if (bit_cycles < 16u)
-    {
-        bit_cycles = 16u;
-    }
-
-    SoftUart_DelayCycles(bit_cycles / 2u);
-    if (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
-    {
-        return 0u;
-    }
-
-    SoftUart_DelayCycles(bit_cycles);
-
-    uint8_t value = 0u;
-    for (uint8_t i = 0u; i < 8u; i++)
-    {
-        if (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
+        __disable_irq();
+        next = (uint16_t)((g_su_tx_w + 1u) & (SOFTUART_TX_BUF_SIZE - 1u));
+        if (next != g_su_tx_r)
         {
-            value |= (uint8_t)(1u << i);
+            g_su_tx_buf[g_su_tx_w] = b;
+            g_su_tx_w = next;
+            if (!g_su_tx_active)
+            {
+                SoftUart_TxKickFromIsr();
+            }
+            __enable_irq();
+            break;
         }
-        SoftUart_DelayCycles(bit_cycles);
-    }
+        __enable_irq();
+    } while (1);
+}
 
-    uint8_t stop = (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN)) ? 1u : 0u;
-    SoftUart_DelayCycles(bit_cycles);
-    if (0u == stop)
+static uint8_t SoftUart_ReadByte(uint8_t* out)
+{
+    uint8_t ok = 0u;
+    __disable_irq();
+    if (g_su_rx_r != g_su_rx_w)
     {
-        return 0u;
+        *out = g_su_rx_buf[g_su_rx_r];
+        g_su_rx_r = (uint16_t)((g_su_rx_r + 1u) & (SOFTUART_RX_BUF_SIZE - 1u));
+        ok = 1u;
     }
-
-    *out = value;
-    return 1u;
+    __enable_irq();
+    return ok;
 }
 
 int fputc(int ch, FILE *f)
 {
     (void)f;
-    Uart0_SendByteTimeout((uint8_t)ch);
+    if ('\n' == ch)
+    {
+        SoftUart_WriteByte('\r');
+    }
+    SoftUart_WriteByte((uint8_t)ch);
     return ch;
+}
+
+static void SoftUart_Init(void)
+{
+    Sysctrl_SetPeripheralGate(SysctrlPeripheralGpio, TRUE);
+    Sysctrl_SetPeripheralGate(SysctrlPeripheralBt, TRUE);
+
+    stc_gpio_cfg_t tx;
+    DDL_ZERO_STRUCT(tx);
+    tx.enDir = GpioDirOut;
+    tx.enDrv = GpioDrvH;
+    tx.enPu = GpioPuDisable;
+    tx.enPd = GpioPdDisable;
+    tx.enOD = GpioOdDisable;
+    Gpio_Init(SOFTUART_TX_PORT, SOFTUART_TX_PIN, &tx);
+    Gpio_WriteOutputIO(SOFTUART_TX_PORT, SOFTUART_TX_PIN, TRUE);
+
+    stc_gpio_cfg_t rx;
+    DDL_ZERO_STRUCT(rx);
+    rx.enDir = GpioDirIn;
+    rx.enDrv = GpioDrvH;
+    rx.enPu = GpioPuEnable;
+    rx.enPd = GpioPdDisable;
+    rx.enOD = GpioOdDisable;
+    Gpio_Init(SOFTUART_RX_PORT, SOFTUART_RX_PIN, &rx);
+
+    Gpio_EnableIrq(GpioPort0, GpioPin3, GpioIrqFalling);
+    Gpio_ClearIrq(GpioPort0, GpioPin3);
+    EnableNvic(PORT0_IRQn, IrqLevel1, TRUE);
+
+    uint16_t reload = SoftUart_CalcTimReload(SOFTUART_TICK_HZ);
+    M0P_TIM0->CR_f.CTEN = FALSE;
+    M0P_TIM0->CR_f.GATEP = 0u;
+    M0P_TIM0->CR_f.GATE = 0u;
+    M0P_TIM0->CR_f.PRS = 0u;
+    M0P_TIM0->CR_f.TOGEN = FALSE;
+    M0P_TIM0->CR_f.CT = 0u;
+    M0P_TIM0->CR_f.MD = 1u;
+    M0P_TIM0->ARR = reload;
+    M0P_TIM0->CNT = reload;
+    M0P_TIM0->ICLR_f.UIF = FALSE;
+    M0P_TIM0->CR_f.UIE = TRUE;
+    EnableNvic(TIM0_IRQn, IrqLevel0, TRUE);
+    M0P_TIM0->CR_f.CTEN = TRUE;
 }
 
 // ===================== 外设初始化 =====================
@@ -165,15 +223,16 @@ void Uart_Init_Config(void)
 
     // 4. 设置波特率 (9600)
     stcBaud.enMode = UartMode1;
-    stcBaud.bDbaud = FALSE;
+    stcBaud.bDbaud = TRUE;
     stcBaud.u32Pclk = Sysctrl_GetPClkFreq(); // 获取当前PCLK时钟频率
     stcBaud.u32Baud = SOFTUART_BAUD;
     uint16_t reload = Uart_SetBaudRate(M0P_UART0, &stcBaud);
-    Tim0_StartForUartBaud(reload);
+    (void)reload;
 
     // 5. 清除标志位并使能收发 (UartRenFunc 宏即可使能模式1下的收发)
-    Uart_ClrStatus(M0P_UART0, UartRC);
-    Uart_ClrStatus(M0P_UART0, UartTC);
+    M0P_UART0->ICR_f.RICLR = 0u;
+    M0P_UART0->ICR_f.TICLR = 0u;
+    M0P_UART0->ICR_f.FECLR = 0u;
     Uart_EnableFunc(M0P_UART0, UartRenFunc);
 }
 
@@ -254,7 +313,7 @@ int main(void)
     Gpio_WriteOutputIO(LED_PORT, LED_PIN, TRUE); // 默认高电平(熄灭)
     
     // 4. 初始化 串口
-    Uart_Init_Config();
+    SoftUart_Init();
     Instruction_Init();
     printf("\r\nstart\r\n");
 
@@ -275,7 +334,7 @@ int main(void)
         static uint32_t cmd_len = 0u;
 
         uint8_t c = 0u;
-        while (1u == SoftUart_TryReadByte(&c))
+        while (1u == SoftUart_ReadByte(&c))
         {
             if (c == '\b' || c == 0x7Fu)
             {
@@ -283,16 +342,16 @@ int main(void)
                 {
                     cmd_len--;
                 }
-                Uart0_SendByteTimeout('\b');
-                Uart0_SendByteTimeout(' ');
-                Uart0_SendByteTimeout('\b');
+                SoftUart_WriteByte('\b');
+                SoftUart_WriteByte(' ');
+                SoftUart_WriteByte('\b');
                 continue;
             }
 
             if (c == '\r' || c == '\n')
             {
-                Uart0_SendByteTimeout('\r');
-                Uart0_SendByteTimeout('\n');
+                SoftUart_WriteByte('\r');
+                SoftUart_WriteByte('\n');
 
                 if (cmd_len > 0u)
                 {
@@ -303,10 +362,96 @@ int main(void)
                 continue;
             }
 
-            Uart0_SendByteTimeout(c);
+            SoftUart_WriteByte(c);
             if (cmd_len < (sizeof(cmd_buf) - 1u))
             {
                 cmd_buf[cmd_len++] = (char)c;
+            }
+        }
+    }
+}
+
+void Tim0_IRQHandler(void)
+{
+    if (TRUE != M0P_TIM0->IFR_f.UIF)
+    {
+        return;
+    }
+    M0P_TIM0->ICLR_f.UIF = FALSE;
+
+    if (g_su_tx_active)
+    {
+        if (0u == g_su_tx_tick)
+        {
+            uint8_t bit = (uint8_t)((g_su_tx_frame >> g_su_tx_bitpos) & 1u);
+            Gpio_WriteOutputIO(SOFTUART_TX_PORT, SOFTUART_TX_PIN, (bit != 0u) ? TRUE : FALSE);
+        }
+
+        g_su_tx_tick++;
+        if (g_su_tx_tick >= SOFTUART_TICKS_PER_BIT)
+        {
+            g_su_tx_tick = 0u;
+            g_su_tx_bitpos++;
+            if (g_su_tx_bitpos >= 10u)
+            {
+                g_su_tx_active = 0u;
+                Gpio_WriteOutputIO(SOFTUART_TX_PORT, SOFTUART_TX_PIN, TRUE);
+                SoftUart_TxKickFromIsr();
+            }
+        }
+    }
+    else
+    {
+        SoftUart_TxKickFromIsr();
+    }
+
+    if (g_su_rx_active)
+    {
+        if (g_su_rx_sample_ticks > 0u)
+        {
+            g_su_rx_sample_ticks--;
+        }
+        if (0u == g_su_rx_sample_ticks)
+        {
+            uint8_t bit = (TRUE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN)) ? 1u : 0u;
+            if (g_su_rx_bitpos < 8u)
+            {
+                g_su_rx_value |= (uint8_t)(bit << g_su_rx_bitpos);
+                g_su_rx_bitpos++;
+                g_su_rx_sample_ticks = SOFTUART_TICKS_PER_BIT;
+            }
+            else
+            {
+                if (bit != 0u)
+                {
+                    uint16_t next = (uint16_t)((g_su_rx_w + 1u) & (SOFTUART_RX_BUF_SIZE - 1u));
+                    if (next != g_su_rx_r)
+                    {
+                        g_su_rx_buf[g_su_rx_w] = g_su_rx_value;
+                        g_su_rx_w = next;
+                    }
+                }
+                g_su_rx_active = 0u;
+                Gpio_EnableIrq(GpioPort0, GpioPin3, GpioIrqFalling);
+            }
+        }
+    }
+}
+
+void Port0_IRQHandler(void)
+{
+    if (TRUE == Gpio_GetIrqStatus(GpioPort0, GpioPin3))
+    {
+        Gpio_ClearIrq(GpioPort0, GpioPin3);
+        if (!g_su_rx_active)
+        {
+            if (FALSE == Gpio_GetInputIO(SOFTUART_RX_PORT, SOFTUART_RX_PIN))
+            {
+                g_su_rx_active = 1u;
+                g_su_rx_bitpos = 0u;
+                g_su_rx_value = 0u;
+                g_su_rx_sample_ticks = SOFTUART_RX_START_TICKS;
+                Gpio_DisableIrq(GpioPort0, GpioPin3, GpioIrqFalling);
             }
         }
     }
